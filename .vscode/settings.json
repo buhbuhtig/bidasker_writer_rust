@@ -1,25 +1,22 @@
 {
-    // Прямые пути к инструментам
     "rust-analyzer.server.path": "/root/.cargo/bin/rust-analyzer",
-    
-    // Подсказываем расширению, где искать стандартные библиотеки
+    "rust-analyzer.cargo.executable": "/root/.cargo/bin/cargo",
     "rust-analyzer.cargo.sysroot": "discover",
-
-    // Автоматическая проверка кода при сохранении (используем clippy для обучения)
     "rust-analyzer.check.command": "clippy",
-    
-    // Форматирование кода по стандарту Rust при каждом сохранении
     "editor.formatOnSave": true,
     "editor.defaultFormatter": "rust-lang.rust-analyzer",
-
-    // Включаем "умные" подсказки типов прямо в тексте кода
     "rust-analyzer.inlayHints.typeHints.enable": true,
     "rust-analyzer.inlayHints.parameterHints.enable": true,
     "rust-analyzer.inlayHints.chainingHints.enable": true,
 
-    // Прокидываем пути в терминал VS Code, чтобы команды cargo работали всегда
+    // Добавляем вот эту секцию специально для кнопок запуска
+    "rust-analyzer.runnables.extraArgs": [],
+    
+    "terminal.integrated.env.linux": {
+        "PATH": "/root/.cargo/bin:${env:PATH}"
+    },
     "rust-analyzer.terminal.env": {
-        "PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PATH": "/root/.cargo/bin:${env:PATH}",
         "RUSTUP_HOME": "/root/.rustup",
         "CARGO_HOME": "/root/.cargo"
     }
