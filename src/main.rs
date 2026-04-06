@@ -14,6 +14,13 @@ use tokio::time::{sleep, Duration, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::{error, info, warn};
 use sysinfo::{System, ProcessesToUpdate};
+use tracing_subscriber::filter::LevelFilter;
+
+// --- НОВЫЕ ИМПОРТЫ ДЛЯ TRACING ---
+use tracing_subscriber::filter::filter_fn;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::Layer;
 
 // ==========================================
 // 1. НАСТРОЙКИ И КОНСТАНТЫ
@@ -25,7 +32,7 @@ const MAX_COINS: usize = 2000;
 const RECORD_SIZE: usize = 128; // 128 кратно размеру кэш-линии (False Sharing fix)
 const SHM_SIZE: usize = MAX_COINS * RECORD_SIZE;
 
-const STATS_REPORT_INTERVAL_SEC: u64 = 30;
+const STATS_REPORT_INTERVAL_SEC: u64 = 60;
 const LATENCY_CRITICAL_MS: f64 = 500.0;
 const WS_TIMEOUT_SEC: u64 = 200; // 3 минуты Ping от Binance + 20 сек
 
@@ -35,7 +42,9 @@ const REQUESTED_SIZE_BUFFER: u32 = 2 * 1024 * 1024; // 2 MB
 
 // --- НАСТРОЙКИ ПЛАНОГО ПЕРЕПОДКЛЮЧЕНИЯ ---
 const SCHEDULED_RECONNECT_INTERVAL_SEC: u64 = 3600; // 1 час (3600 секунд)
-const STREAMS_RESUBSCRIBE_DELAY_SEC: u64 = 5; // Пауза между рестартом воркеров внутри цикла
+const STREAMS_RESUBSCRIBE_DELAY_SEC: u64 = 30; // Пауза между рестартом воркеров внутри цикла
+const EXCHANGE_INFO_SYNC_INTERVAL_SEC: u64 = 180; 
+
 
 #[derive(Clone, Copy)]
 struct MmapPtr(*mut u8);
@@ -254,8 +263,6 @@ async fn dedicated_ws_worker(
                     }
                 }
 
-                // OptionFuture безопасно конвертирует Option<&mut JoinHandle> в Future
-                // Это позволяет избежать паники "unwrap() on a None value" без async блока
                 res = OptionFuture::from(warmup_task.as_mut()), if warmup_task.is_some() => {
                     warmup_task = None;
                     if let Some(res_inner) = res {
@@ -389,7 +396,12 @@ async fn ws_worker(
                             WorkerCmd::Unsubscribe(syms) => {
                                 let mut streams = Vec::new();
                                 for sym in syms {
-                                    local_registry.remove(&sym);
+                                    if let Some((offset, _)) = local_registry.remove(&sym) {
+                                        unsafe {
+                                            std::ptr::write_bytes(mmap_ptr.0.add(offset), 0, RECORD_SIZE);
+                                            std::sync::atomic::fence(Ordering::Release);
+                                        }
+                                    }
                                     streams.push(format!("{}@bookTicker", sym.to_lowercase()));
                                 }
                                 for chunk in streams.chunks(50) {
@@ -407,7 +419,6 @@ async fn ws_worker(
                     }
                 }
 
-                // Используем OptionFuture для безопасного и правильного опроса Option<&mut JoinHandle>
                 res = OptionFuture::from(warmup_task.as_mut()), if warmup_task.is_some() => {
                     warmup_task = None;
                     if let Some(res_inner) = res {
@@ -505,7 +516,6 @@ async fn scheduled_reconnector(all_txs: Vec<mpsc::Sender<WorkerCmd>>) {
         for (i, tx) in all_txs.iter().enumerate() {
             let _ = tx.send(WorkerCmd::PlannedReconnect).await;
             if i < all_txs.len() - 1 {
-                // Роллинг апдейт с задержкой между переподключениями соседних воркеров
                 sleep(Duration::from_secs(STREAMS_RESUBSCRIBE_DELAY_SEC)).await;
             }
         }
@@ -530,8 +540,12 @@ async fn orchestrator(
     let mut symbol_to_index: FxHashMap<String, usize> = FxHashMap::default();
     let mut worker_symbols: Vec<FxHashMap<String, usize>> = vec![FxHashMap::default(); num_workers];
     let mut free_indices: Vec<usize> = Vec::new();
+    let mut quarantine: std::collections::VecDeque<(usize, Instant)> = std::collections::VecDeque::new();
     let mut next_index = starting_index; 
     let tag = format!("{}-ORCH", market);
+    
+    // Флаг инициализации для предотвращения спама при старте
+    let mut is_initialized = false;
 
     loop {
         match client.get(&rest_url).send().await {
@@ -558,10 +572,14 @@ async fn orchestrator(
                         for sym in &current_set { if !latest_set.contains(sym) { delistings.push(sym.clone()); } }
 
                         if !delistings.is_empty() {
+                            // Логируем делистинг только после первичной инициализации
+                            if is_initialized {
+                                info!(target: "listing_events", "[{:<22}] Делистинг: удалено {} монет: {:?}", tag, delistings.len(), delistings);
+                            }
+
                             for sym in &delistings {
                                 if let Some(idx) = symbol_to_index.remove(sym) {
-                                    free_indices.push(idx);
-                                    unsafe { std::ptr::write_bytes(mmap_ptr.0.add(idx * RECORD_SIZE), 0, RECORD_SIZE); }
+                                    quarantine.push_back((idx, Instant::now()));
                                 }
                                 for (w_id, map) in worker_symbols.iter_mut().enumerate() {
                                     if map.remove(sym).is_some() {
@@ -571,7 +589,26 @@ async fn orchestrator(
                             }
                         }
 
+                        let now = Instant::now();
+                        while let Some(&(idx, queued_at)) = quarantine.front() {
+                            if now.duration_since(queued_at).as_secs() >= 30 {
+                                unsafe { 
+                                    std::ptr::write_bytes(mmap_ptr.0.add(idx * RECORD_SIZE), 0, RECORD_SIZE); 
+                                    std::sync::atomic::fence(Ordering::Release);
+                                }
+                                free_indices.push(idx); 
+                                quarantine.pop_front();
+                            } else {
+                                break; 
+                            }
+                        }
+
                         if !new_listings.is_empty() {
+                            // Логируем новые листинги только после первичной инициализации
+                            if is_initialized {
+                                info!(target: "listing_events", "[{:<22}] Листинг: добавлено {} монет: {:?}", tag, new_listings.len(), new_listings);
+                            }
+
                             let mut distribute = vec![Vec::new(); num_workers];
                             for sym in new_listings {
                                 let idx = if let Some(f_idx) = free_indices.pop() { f_idx } else { let i = next_index; next_index += 1; i };
@@ -594,12 +631,18 @@ async fn orchestrator(
                                 if !payload.is_empty() { let _ = worker_txs[i].send(WorkerCmd::Subscribe(payload)).await; }
                             }
                         }
+
+                        // Установка флага по завершении первого прохода
+                        if !is_initialized {
+                            is_initialized = true;
+                            info!("[{:<22}] Первичная синхронизация завершена", tag);
+                        }
                     }
                 }
             }
             Err(e) => error!("[{:<22}] Ошибка REST API: {}", tag, e),
         }
-        sleep(Duration::from_secs(3600)).await;
+        sleep(Duration::from_secs(EXCHANGE_INFO_SYNC_INTERVAL_SEC)).await;
     }
 }
 
@@ -627,17 +670,43 @@ async fn monitor_system_load() {
 #[tokio::main]
 async fn main() {
     std::fs::create_dir_all(LOG_DIR).unwrap();
-    let file_appender = tracing_appender::rolling::daily(LOG_DIR, "writer.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    
-    // Формат логов выровнен для ровной табличности
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
+
+    // --- НОВАЯ СИСТЕМА ИНИЦИАЛИЗАЦИИ ЛОГОВ ---
+    // 1. Основной лог (всё, КРОМЕ событий листинга)
+    let main_appender = tracing_appender::rolling::daily(LOG_DIR, "writer.log");
+    let (main_nb, _guard_main) = tracing_appender::non_blocking(main_appender);
+
+    let main_layer = tracing_subscriber::fmt::layer()
+        .with_writer(main_nb)
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)
         .with_ansi(false)
+        .with_filter(filter_fn(|metadata| {
+            metadata.target() != "listing_events"
+        }));
+
+    // 2. Лог листингов (ТОЛЬКО события листинга)
+    let list_appender = tracing_appender::rolling::daily(LOG_DIR, "listings.log");
+    let (list_nb, _guard_list) = tracing_appender::non_blocking(list_appender);
+
+    let listing_layer = tracing_subscriber::fmt::layer()
+        .with_writer(list_nb)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_thread_names(false)
+        .with_ansi(false)
+        .with_filter(filter_fn(|metadata| {
+            metadata.target() == "listing_events"
+        }));
+
+    // Регистрируем слои
+    tracing_subscriber::registry()
+        .with(LevelFilter::INFO) 
+        .with(main_layer)
+        .with(listing_layer)
         .init();
+    // ------------------------------------------
 
     info!("Запуск Binance Writer: Бесшовный реконнект (Graceful Drain) + Интервальный планировщик");
 
