@@ -25,12 +25,12 @@ use tracing_subscriber::Layer;
 // ==========================================
 // 1. НАСТРОЙКИ И КОНСТАНТЫ
 // ==========================================
-const LOG_DIR: &str = "/bidasker_writer_rust/log";
-const MMAP_DIR: &str = "/bidasker_writer_rust/mmap";
+//const LOG_DIR: &str = "/bidasker_writer_rust/log";
+//const MMAP_DIR: &str = "/bidasker_writer_rust/mmap";
 
-const MAX_COINS: usize = 2000;
+//const MAX_COINS: usize = 2000;
 const RECORD_SIZE: usize = 128; // 128 кратно размеру кэш-линии (False Sharing fix)
-const SHM_SIZE: usize = MAX_COINS * RECORD_SIZE;
+//const SHM_SIZE: usize = MAX_COINS * RECORD_SIZE;
 
 const STATS_REPORT_INTERVAL_SEC: u64 = 60;
 const LATENCY_CRITICAL_MS: f64 = 500.0;
@@ -162,11 +162,14 @@ async fn connect_to_binance_ws(ws_url: &str) -> Result<WsStream, String> {
         .map_err(|e| format!("Socket: {}", e))?;
 
     let _ = socket.set_recv_buffer_size(REQUESTED_SIZE_BUFFER);
-    let tcp_stream = socket.connect(addr).await.map_err(|e| format!("TCP Connect: {}", e))?;
+    let tcp_stream = tokio::time::timeout(Duration::from_secs(10), socket.connect(addr))
+        .await.map_err(|_| "Timeout: TCP Connect".to_string())?
+        .map_err(|e| format!("TCP Connect: {}", e))?;
     let _ = tcp_stream.set_nodelay(true);
 
-    let (ws_stream, _) = tokio_tungstenite::client_async_tls(request, tcp_stream)
-        .await.map_err(|e| format!("TLS/WS: {}", e))?;
+    let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(10), tokio_tungstenite::client_async_tls(request, tcp_stream))
+        .await.map_err(|_| "Timeout: TLS/WS Handshake".to_string())?
+        .map_err(|e| format!("TLS/WS: {}", e))?;
 
     Ok(ws_stream)
 }
@@ -183,8 +186,10 @@ async fn warmup_new_stream(ws_url: String, streams: Vec<String>) -> Result<WsStr
             };
             let msg = tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&payload).unwrap().into());
             
-            if let Err(e) = ws_stream.send(msg).await {
-                return Err(format!("Ошибка отправки SUBSCRIBE: {}", e));
+            match tokio::time::timeout(Duration::from_secs(5), ws_stream.send(msg)).await {
+                Ok(Err(e)) => return Err(format!("Ошибка отправки SUBSCRIBE: {}", e)),
+                Err(_) => return Err("Таймаут отправки SUBSCRIBE".to_string()),
+                Ok(Ok(_)) => {}
             }
             
             let delay = tokio::time::sleep(Duration::from_millis(300));
@@ -241,7 +246,12 @@ async fn dedicated_ws_worker(
             params: vec![stream_name.clone()],
             id: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64,
         };
-        let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&payload).unwrap().into())).await;
+        let msg = tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&payload).unwrap().into());
+        if tokio::time::timeout(Duration::from_secs(5), write.send(msg)).await.is_err() {
+            error!("[{:<22}] Таймаут отправки подписки. Реконнект...", tag);
+            sleep(Duration::from_secs(1)).await;
+            continue; // Пробуем всё заново
+        }
 
         let mut msg_count = 0u64;
         let mut sum_latency = 0.0;
@@ -308,6 +318,9 @@ async fn dedicated_ws_worker(
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_)))) => { let _ = write.flush().await; }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) | Err(_) => {
                             warn!("[{:<22}] Внезапный разрыв. Принудительный реконнект...", tag);
+                            if let Some(task) = warmup_task.take() {
+                                task.abort();
+                            }
                             break;
                         }
                         _ => {}
@@ -351,7 +364,7 @@ async fn ws_worker(
     let mut local_registry: FxHashMap<String, (usize, u64)> = FxHashMap::default();
     let tag = format!("{}-W{}", market, worker_id);
 
-    loop {
+    'connection: loop { 
         let ws_stream = match connect_to_binance_ws(&ws_url).await {
             Ok(s) => s,
             Err(e) => { error!("[{:<22}] Ошибка: {}", tag, e); sleep(Duration::from_secs(3)).await; continue; }
@@ -361,10 +374,14 @@ async fn ws_worker(
         if !local_registry.is_empty() {
             let streams: Vec<String> = local_registry.keys().map(|s| format!("{}@bookTicker", s.to_lowercase())).collect();
             for chunk in streams.chunks(50) {
-                let p = WsCommand { method: "SUBSCRIBE".to_string(), params: chunk.to_vec(), id: 1 };
-                let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&p).unwrap().into())).await;
-                sleep(Duration::from_millis(300)).await;
+            let p = WsCommand { method: "SUBSCRIBE".to_string(), params: chunk.to_vec(), id: 1 };
+            let msg = tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&p).unwrap().into());
+            if tokio::time::timeout(Duration::from_secs(5), write.send(msg)).await.is_err() {
+                error!("[{:<22}] Таймаут при восстановлении подписок. Реконнект...", tag);
+                continue 'connection; // <--- Прыгаем в начало коннекта
             }
+            sleep(Duration::from_millis(300)).await;
+        }
         }
 
         let mut msg_count = 0u64;
@@ -376,7 +393,7 @@ async fn ws_worker(
 
         let mut warmup_task: Option<tokio::task::JoinHandle<Result<WsStream, String>>> = None;
 
-        loop {
+        'events: loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => {
                     if let Some(cmd) = cmd {
@@ -389,10 +406,20 @@ async fn ws_worker(
                                 }
                                 for chunk in streams.chunks(50) {
                                     let p = WsCommand { method: "SUBSCRIBE".to_string(), params: chunk.to_vec(), id: 1 };
-                                    let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&p).unwrap().into())).await;
+                                    let msg = tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&p).unwrap().into());
+                                    if tokio::time::timeout(Duration::from_secs(5), write.send(msg)).await.is_err() {
+                                        warn!("[{:<22}] Зависла отправка SUBSCRIBE. Разрыв связи...", tag);
+                                        if let Some(task) = warmup_task.take() { task.abort(); }
+                                        break 'events; // <--- Выходим из цикла событий, чтобы попасть на реконнект
+                                    }
                                     sleep(Duration::from_millis(300)).await;
                                 }
-                            }
+                                // Важно: если мы вышли из цикла выше по ошибке, нужно прервать воркер
+                                if !local_registry.is_empty() && last_report.elapsed().as_secs() < 1 { /* проверка на случай обрыва в цикле */ } 
+                                // (На самом деле, проще всего будет если write.send вернет ошибку, 
+                                // но если зависнет — вышеуказанный break выйдет только из цикла чанков. 
+                                // Но так как сокет забит, следующий же read.next() в select упадет по таймауту WS_TIMEOUT_SEC)
+                                                            }
                             WorkerCmd::Unsubscribe(syms) => {
                                 let mut streams = Vec::new();
                                 for sym in syms {
@@ -406,7 +433,12 @@ async fn ws_worker(
                                 }
                                 for chunk in streams.chunks(50) {
                                     let p = WsCommand { method: "UNSUBSCRIBE".to_string(), params: chunk.to_vec(), id: 1 };
-                                    let _ = write.send(tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&p).unwrap().into())).await;
+                                    let msg = tokio_tungstenite::tungstenite::Message::Text(simd_json::to_string(&p).unwrap().into());
+                                    if tokio::time::timeout(Duration::from_secs(5), write.send(msg)).await.is_err() {
+                                        warn!("[{:<22}] Зависла отправка UNSUBSCRIBE. Разрыв связи...", tag);
+                                        if let Some(task) = warmup_task.take() { task.abort(); }
+                                        break 'events; // <--- Выходим из цикла событий
+                                    }
                                 }
                             }
                             WorkerCmd::PlannedReconnect => {
@@ -468,6 +500,9 @@ async fn ws_worker(
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_)))) => { let _ = write.flush().await; }
                         Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) | Err(_) => {
                             warn!("[{:<22}] Внезапный разрыв. Принудительный реконнект...", tag);
+                            if let Some(task) = warmup_task.take() {
+                                task.abort();
+                            }
                             break;
                         }
                         _ => {}
@@ -535,8 +570,12 @@ async fn orchestrator(
     mmap_ptr: MmapPtr,
     skip_symbols: Vec<String>,
     starting_index: usize,
+    max_coins: usize,
 ) {
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
     let mut symbol_to_index: FxHashMap<String, usize> = FxHashMap::default();
     let mut worker_symbols: Vec<FxHashMap<String, usize>> = vec![FxHashMap::default(); num_workers];
     let mut free_indices: Vec<usize> = Vec::new();
@@ -612,7 +651,7 @@ async fn orchestrator(
                             let mut distribute = vec![Vec::new(); num_workers];
                             for sym in new_listings {
                                 let idx = if let Some(f_idx) = free_indices.pop() { f_idx } else { let i = next_index; next_index += 1; i };
-                                if idx >= MAX_COINS { continue; }
+                                if idx >= max_coins { continue; }
                                 symbol_to_index.insert(sym.clone(), idx);
                                 
                                 let mut min_w = 0; let mut min_len = usize::MAX;
@@ -646,10 +685,11 @@ async fn orchestrator(
     }
 }
 
-fn init_mmap(file_name: &str) -> MmapPtr {
-    std::fs::create_dir_all(MMAP_DIR).unwrap();
-    let file = OpenOptions::new().read(true).write(true).create(true).open(&format!("{}/{}", MMAP_DIR, file_name)).unwrap();
-    file.set_len(SHM_SIZE as u64).unwrap();
+fn init_mmap(mmap_dir: &str, file_name: &str, shm_size: usize) -> MmapPtr {
+    std::fs::create_dir_all(mmap_dir).expect("Failed to create MMAP_DIR");
+    let path = format!("{}/{}", mmap_dir, file_name);
+    let file = OpenOptions::new().read(true).write(true).create(true).open(&path).unwrap();
+    file.set_len(shm_size as u64).unwrap();
     let mut mmap = unsafe { MmapOptions::new().map_mut(&file).unwrap() };
     mmap.fill(0); 
     MmapPtr(Box::leak(Box::new(mmap)).as_mut_ptr())
@@ -660,58 +700,75 @@ async fn monitor_system_load() {
     let pid = sysinfo::get_current_pid().unwrap();
     loop {
         sleep(Duration::from_secs(60)).await;
-        sys.refresh_processes(ProcessesToUpdate::All, true);
+        // Обновляем инфу ТОЛЬКО для нашего процесса
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true); 
+        
         if let Some(process) = sys.process(pid) {
-            info!("[{:<22}] CPU: {:>5.1}% (от 1 ядра) | RAM: {:.1} MB", "MONITOR", process.cpu_usage(), process.memory() as f64 / 1024.0 / 1024.0);
+            info!("[{:<22}] CPU: {:>5.1}% | RAM: {:.1} MB", "MONITOR", process.cpu_usage(), process.memory() as f64 / 1024.0 / 1024.0);
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    std::fs::create_dir_all(LOG_DIR).unwrap();
+    // 1. Сначала загружаем конфиг и используем println!, так как логи еще не работают
+    let (log_dir, mmap_dir, max_coins) = match dotenvy::dotenv() {
+        Ok(path) => {
+            println!("✅ Файл .env найден: {:?}", path);
+            (
+                std::env::var("LOG_DIR").unwrap_or_else(|_| "/bidasker_writer_rust/log".to_string()),
+                std::env::var("MMAP_DIR").unwrap_or_else(|_| "/bidasker_writer_rust/mmap".to_string()),
+                std::env::var("MAX_COINS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000),
+            )
+        }
+        Err(_) => {
+            println!("⚠️ Файл .env не найден. Используются параметры по умолчанию.");
+            (
+                "/bidasker_writer_rust/log".to_string(),
+                "/bidasker_writer_rust/mmap".to_string(),
+                2000,
+            )
+        }
+    };
 
-    // --- НОВАЯ СИСТЕМА ИНИЦИАЛИЗАЦИИ ЛОГОВ ---
-    // 1. Основной лог (всё, КРОМЕ событий листинга)
-    let main_appender = tracing_appender::rolling::daily(LOG_DIR, "writer.log");
+    let shm_size = max_coins * RECORD_SIZE;
+    std::fs::create_dir_all(&log_dir).expect("Не удалось создать директорию логов");
+
+    // 2. Настраиваем аппендеры
+    let main_appender = tracing_appender::rolling::daily(&log_dir, "writer.log");
     let (main_nb, _guard_main) = tracing_appender::non_blocking(main_appender);
 
     let main_layer = tracing_subscriber::fmt::layer()
         .with_writer(main_nb)
         .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
         .with_ansi(false)
-        .with_filter(filter_fn(|metadata| {
-            metadata.target() != "listing_events"
-        }));
+        .with_filter(filter_fn(|metadata| metadata.target() != "listing_events"));
 
-    // 2. Лог листингов (ТОЛЬКО события листинга)
-    let list_appender = tracing_appender::rolling::daily(LOG_DIR, "listings.log");
+    let list_appender = tracing_appender::rolling::daily(&log_dir, "listings.log");
     let (list_nb, _guard_list) = tracing_appender::non_blocking(list_appender);
 
     let listing_layer = tracing_subscriber::fmt::layer()
         .with_writer(list_nb)
         .with_target(false)
-        .with_thread_ids(false)
-        .with_thread_names(false)
         .with_ansi(false)
-        .with_filter(filter_fn(|metadata| {
-            metadata.target() == "listing_events"
-        }));
+        .with_filter(filter_fn(|metadata| metadata.target() == "listing_events"));
 
-    // Регистрируем слои
+    // 3. Инициализируем систему логов
     tracing_subscriber::registry()
         .with(LevelFilter::INFO) 
         .with(main_layer)
         .with(listing_layer)
         .init();
-    // ------------------------------------------
+
+    // 4. ТЕПЕРЬ можно писать в info!
+    info!("--- ЗАПУСК СИСТЕМЫ ---");
+    info!("Конфигурация: LOG_DIR={}, MMAP_DIR={}, MAX_COINS={}", log_dir, mmap_dir, max_coins);
+    info!("Память: SHM_SIZE = {} байт", shm_size);
 
     info!("Запуск Binance Writer: Бесшовный реконнект (Graceful Drain) + Интервальный планировщик");
 
-    let ptr_fut = init_mmap("binance_bbo_futum_mem.mmap");
-    let ptr_spot = init_mmap("binance_bbo_spot_mem.mmap");
+    let ptr_fut = init_mmap(&mmap_dir, "binance_bbo_futum_mem.mmap", shm_size);
+    let ptr_spot = init_mmap(&mmap_dir, "binance_bbo_spot_mem.mmap", shm_size);
 
     let mut skip_fut = Vec::new();
     let mut skip_spot = Vec::new();
@@ -757,13 +814,31 @@ async fn main() {
         tokio::spawn(ws_worker("SPOT", i, "wss://stream.binance.com:9443/stream".to_string(), ptr_spot, rx));
     }
 
-    tokio::spawn(orchestrator("FUTURES".to_string(), "https://fapi.binance.com/fapi/v1/exchangeInfo".to_string(), NUM_WORKERS_FUTURES, fut_orchestrator_txs, ptr_fut, skip_fut, next_idx_fut));
-    tokio::spawn(orchestrator("SPOT".to_string(), "https://api.binance.com/api/v3/exchangeInfo".to_string(), NUM_WORKERS_SPOT, spot_orchestrator_txs, ptr_spot, skip_spot, next_idx_spot));
+    tokio::spawn(orchestrator("FUTURES".to_string(), "https://fapi.binance.com/fapi/v1/exchangeInfo".to_string(), NUM_WORKERS_FUTURES, fut_orchestrator_txs, ptr_fut, skip_fut, next_idx_fut, max_coins ));
+    tokio::spawn(orchestrator("SPOT".to_string(), "https://api.binance.com/api/v3/exchangeInfo".to_string(), NUM_WORKERS_SPOT, spot_orchestrator_txs, ptr_spot, skip_spot, next_idx_spot, max_coins ));
     
     tokio::spawn(scheduled_reconnector(all_reconnect_txs));
     
     tokio::spawn(monitor_system_load());
 
-    tokio::signal::ctrl_c().await.unwrap();
-    info!("Выход.");
+    // --- БЛОК ОЖИДАНИЯ ЗАВЕРШЕНИЯ ---
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+
+        tokio::select! {
+            _ = sigterm.recv() => info!("Получен сигнал SIGTERM. Завершение работы..."),
+            _ = sigint.recv() => info!("Получен сигнал SIGINT (Ctrl+C). Завершение работы..."),
+        };
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.unwrap();
+        info!("Выход по Ctrl+C...");
+    }
+
+    info!("Процесс Binance Writer остановлен.");
 }

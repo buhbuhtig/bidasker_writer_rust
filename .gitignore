@@ -1,4 +1,5 @@
 /target
 **mmap**
 /log/**
+.env
 
