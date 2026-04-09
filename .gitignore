@@ -2,4 +2,5 @@
 **mmap**
 /log/**
 .env
+logs
 

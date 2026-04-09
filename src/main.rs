@@ -25,8 +25,7 @@ use tracing_subscriber::Layer;
 // ==========================================
 // 1. НАСТРОЙКИ И КОНСТАНТЫ
 // ==========================================
-//const LOG_DIR: &str = "/bidasker_writer_rust/log";
-//const MMAP_DIR: &str = "/bidasker_writer_rust/mmap";
+
 
 //const MAX_COINS: usize = 2000;
 const RECORD_SIZE: usize = 128; // 128 кратно размеру кэш-линии (False Sharing fix)
@@ -716,8 +715,8 @@ async fn main() {
         Ok(path) => {
             println!("✅ Файл .env найден: {:?}", path);
             (
-                std::env::var("LOG_DIR").unwrap_or_else(|_| "/bidasker_writer_rust/log".to_string()),
-                std::env::var("MMAP_DIR").unwrap_or_else(|_| "/bidasker_writer_rust/mmap".to_string()),
+                std::env::var("LOG_DIR").unwrap_or_else(|_| "/bidasker_writer_rust/logs".to_string()),
+                std::env::var("MMAP_DIR").unwrap_or_else(|_| "/dev/shm/binance_mmap".to_string()),
                 std::env::var("MAX_COINS").ok().and_then(|v| v.parse().ok()).unwrap_or(2000),
             )
         }
@@ -767,8 +766,8 @@ async fn main() {
 
     info!("Запуск Binance Writer: Бесшовный реконнект (Graceful Drain) + Интервальный планировщик");
 
-    let ptr_fut = init_mmap(&mmap_dir, "binance_bbo_futum_mem.mmap", shm_size);
-    let ptr_spot = init_mmap(&mmap_dir, "binance_bbo_spot_mem.mmap", shm_size);
+    let ptr_fut = init_mmap(&mmap_dir, "binance_basize_fut_mem.mmap", shm_size);
+    let ptr_spot = init_mmap(&mmap_dir, "binance_basize_spot_mem.mmap", shm_size);
 
     let mut skip_fut = Vec::new();
     let mut skip_spot = Vec::new();
